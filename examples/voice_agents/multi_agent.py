@@ -1,157 +1,122 @@
 import logging
-from dataclasses import dataclass
-from typing import Optional
+import os
+import re
+from pathlib import Path
 
 from dotenv import load_dotenv
-
-from livekit import api
 from livekit.agents import (
     Agent,
     AgentServer,
     AgentSession,
-    ChatContext,
     JobContext,
     JobProcess,
+    MetricsCollectedEvent,
     RunContext,
     cli,
     metrics,
+    room_io,
 )
-from livekit.agents.job import get_job_context
-from livekit.agents.llm import function_tool
-from livekit.agents.voice import MetricsCollectedEvent
-from livekit.plugins import deepgram, openai, silero
+from livekit.agents.llm import ChatMessage, function_tool
+from livekit.plugins import silero
 
-# uncomment to enable Krisp BVC noise cancellation, currently supported on Linux and MacOS
-# from livekit.plugins import noise_cancellation
+# --- SETUP & CONFIGURATION ---
 
-## The storyteller agent is a multi-agent that can handoff the session to another agent.
-## This example demonstrates more complex workflows with multiple agents.
-## Each agent could have its own instructions, as well as different STT, LLM, TTS,
-## or realtime models.
+# 1. Load Environment Variables
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
-logger = logging.getLogger("multi-agent")
+# 2. Configure Logging
+logger = logging.getLogger("kelly-agent")
+logging.basicConfig(level=logging.INFO)
 
-load_dotenv()
+if not os.getenv("LIVEKIT_URL"):
+    logger.warning("LIVEKIT_URL is not set in environment variables.")
 
-common_instructions = (
-    "Your name is Echo. You are a story teller that interacts with the user via voice."
-    "You are curious and friendly, with a sense of humor."
-)
+# 3. Model Configuration
+STT_MODEL = "deepgram/nova-3"
+LLM_MODEL = "openai/gpt-4.1-mini"
+TTS_MODEL = "cartesia/sonic-2:9626c31c-bec5-4cca-baa8-f8ba9e84c8bc"
+
+# 4. Smart Interruption Config
+# Words to ignore if the user says them while the agent is talking (Backchanneling)
+IGNORE_WORDS = {
+    "yeah", "ok", "okay", "hmm", "aha", "uh-huh", "right", "sure", "yep", "mhmm"
+}
+
+def clean_text(text: str) -> str:
+    """Normalizes text (removes punctuation, lowercase) for comparison."""
+    return re.sub(r'[^\w\s]', '', text).lower().strip()
 
 
-@dataclass
-class StoryData:
-    # Shared data that's used by the storyteller agent.
-    # This structure is passed as a parameter to function calls.
+# --- AGENT DEFINITION ---
 
-    name: Optional[str] = None
-    location: Optional[str] = None
-
-
-class IntroAgent(Agent):
+class KellyAgent(Agent):
     def __init__(self) -> None:
         super().__init__(
-            instructions=f"{common_instructions} Your goal is to gather a few pieces of "
-            "information from the user to make the story personalized and engaging."
-            "You should ask the user for their name and where they are from."
-            "Start the conversation with a short introduction.",
+            instructions=(
+                "Your name is Kelly. You interact with users via voice. "
+                "Keep your responses concise and to the point. "
+                "Do not use emojis, asterisks, or special characters. "
+                "You are curious, friendly, and have a sense of humor. "
+                "Always speak English."
+            )
         )
 
     async def on_enter(self):
-        # when the agent is added to the session, it'll generate a reply
-        # according to its instructions
+        """Triggered when the agent joins the room."""
         self.session.generate_reply()
 
     @function_tool
-    async def information_gathered(
-        self,
-        context: RunContext[StoryData],
-        name: str,
-        location: str,
+    async def lookup_weather(
+        self, context: RunContext, location: str, latitude: str = None, longitude: str = None
     ):
-        """Called when the user has provided the information needed to make the story
-        personalized and engaging.
-
-        Args:
-            name: The name of the user
-            location: The location of the user
         """
-
-        context.userdata.name = name
-        context.userdata.location = location
-
-        story_agent = StoryAgent(name, location)
-        # by default, StoryAgent will start with a new context, to carry through the current
-        # chat history, pass in the chat_ctx
-        # story_agent = StoryAgent(name, location, chat_ctx=self.chat_ctx)
-
-        logger.info(
-            "switching to the story agent with the provided user data: %s", context.userdata
-        )
-        return story_agent, "Let's start the story!"
+        Get weather information. Estimates coordinates if only location is provided.
+        
+        Args:
+            location: The city or region name.
+            latitude: Estimated latitude (do not ask user).
+            longitude: Estimated longitude (do not ask user).
+        """
+        logger.info(f"Tool Call: Weather lookup for {location}")
+        return "It is currently sunny with a temperature of 70 degrees."
 
 
-class StoryAgent(Agent):
-    def __init__(self, name: str, location: str, *, chat_ctx: Optional[ChatContext] = None) -> None:
-        super().__init__(
-            instructions=f"{common_instructions}. You should use the user's information in "
-            "order to make the story personalized."
-            "create the entire story, weaving in elements of their information, and make it "
-            "interactive, occasionally interating with the user."
-            "do not end on a statement, where the user is not expected to respond."
-            "when interrupted, ask if the user would like to continue or end."
-            f"The user's name is {name}, from {location}.",
-            # each agent could override any of the model services, including mixing
-            # realtime and non-realtime models
-            llm=openai.realtime.RealtimeModel(voice="echo"),
-            tts=None,
-            chat_ctx=chat_ctx,
-        )
-
-    async def on_enter(self):
-        # when the agent is added to the session, we'll initiate the conversation by
-        # using the LLM to generate a reply
-        self.session.generate_reply()
-
-    @function_tool
-    async def story_finished(self, context: RunContext[StoryData]):
-        """When you are fininshed telling the story (and the user confirms they don't
-        want anymore), call this function to end the conversation."""
-        # interrupt any existing generation
-        self.session.interrupt()
-
-        # generate a goodbye message and hang up
-        # awaiting it will ensure the message is played out before returning
-        await self.session.generate_reply(
-            instructions=f"say goodbye to {context.userdata.name}", allow_interruptions=False
-        )
-
-        job_ctx = get_job_context()
-        await job_ctx.api.room.delete_room(api.DeleteRoomRequest(room=job_ctx.room.name))
-
+# --- SERVER SETUP ---
 
 server = AgentServer()
 
-
-def prewarm(proc: JobProcess):
+def prewarm_process(proc: JobProcess):
+    """Pre-load VAD model to reduce latency on startup."""
     proc.userdata["vad"] = silero.VAD.load()
 
+server.setup_fnc = prewarm_process
 
-server.setup_fnc = prewarm
 
+# --- SESSION ENTRYPOINT ---
 
 @server.rtc_session()
 async def entrypoint(ctx: JobContext):
-    session = AgentSession[StoryData](
+    # Setup Context Logging
+    ctx.log_context_fields = {"room": ctx.room.name}
+
+    # State Tracking for Interruption Logic
+    agent_state = {"is_speaking": False}
+
+    session = AgentSession(
+        stt=STT_MODEL,
+        llm=LLM_MODEL,
+        tts=TTS_MODEL,
+        turn_detection=None, # We are handling turns manually via VAD events
         vad=ctx.proc.userdata["vad"],
-        # any combination of STT, LLM, TTS, or realtime API can be used
-        llm=openai.LLM(model="gpt-4o-mini"),
-        stt=deepgram.STT(model="nova-3"),
-        tts=openai.TTS(voice="echo"),
-        userdata=StoryData(),
+        preemptive_generation=True,
+        resume_false_interruption=True,
+        false_interruption_timeout=1.0,
+        # DISABLE automatic interruption to allow "Smart Interruption" logic below
+        allow_interruptions=False, 
     )
 
-    # log metrics as they are emitted, and total usage after session is over
+    # Metrics Collection
     usage_collector = metrics.UsageCollector()
 
     @session.on("metrics_collected")
@@ -159,17 +124,59 @@ async def entrypoint(ctx: JobContext):
         metrics.log_metrics(ev.metrics)
         usage_collector.collect(ev.metrics)
 
-    async def log_usage():
-        summary = usage_collector.get_summary()
-        logger.info(f"Usage: {summary}")
+    # --- STATE HANDLERS ---
+    
+    @session.on("agent_speech_started")
+    def on_agent_speech_started(ev):
+        agent_state["is_speaking"] = True
 
-    ctx.add_shutdown_callback(log_usage)
+    @session.on("agent_speech_stopped")
+    def on_agent_speech_stopped(ev):
+        agent_state["is_speaking"] = False
+
+    # --- SMART INTERRUPTION LOGIC ---
+    
+    @session.on("user_transcription_committed")
+    def on_user_transcription(msg: ChatMessage):
+        user_text = msg.content
+        cleaned_input = clean_text(user_text)
+
+        # Case 1: Agent is currently speaking
+        if agent_state["is_speaking"]:
+            if cleaned_input in IGNORE_WORDS:
+                # Scenario: User said a filler word ("Yeah", "Uh-huh")
+                logger.info(f"IGNORING backchannel: '{user_text}'")
+                
+                # Remove this message from history so LLM doesn't reply to "Yeah" later
+                if session.chat_ctx.messages and session.chat_ctx.messages[-1] == msg:
+                    session.chat_ctx.messages.pop()
+            else:
+                # Scenario: User said a real command -> Interrupt
+                logger.info(f"INTERRUPTING agent for: '{user_text}'")
+                session.interrupt()
+
+        # Case 2: Agent is silent
+        else:
+            # Standard behavior: Process input normally
+            logger.info(f"PROCESSING user input: '{user_text}'")
+
+    # --- SHUTDOWN & START ---
+
+    async def log_usage_on_shutdown():
+        summary = usage_collector.get_summary()
+        logger.info(f"Session Usage Summary: {summary}")
+
+    ctx.add_shutdown_callback(log_usage_on_shutdown)
 
     await session.start(
-        agent=IntroAgent(),
+        agent=KellyAgent(),
         room=ctx.room,
+        room_options=room_io.RoomOptions(
+            audio_input=room_io.AudioInputOptions(
+                # noise_cancellation=noise_cancellation.BVC(), # Uncomment if using Krisp
+            ),
+        ),
     )
-
 
 if __name__ == "__main__":
     cli.run_app(server)
